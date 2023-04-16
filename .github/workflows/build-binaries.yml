@@ -1,0 +1,141 @@
+name: Build binaries for UnblockNeteaseMusic
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v2023-*"
+jobs:
+  build_luci:
+    strategy:
+      matrix:
+        target:
+          - 'windows/amd64'
+      fail-fast: false
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          ref: master
+          fetch-depth: 0
+          lfs: true
+      - name: Set Git Identity
+        run: |
+          git config --global user.email "7850715+github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+      - name: Init Environment
+        run: |
+          sudo -E apt-get -y install upx
+      - name: Set up Go 1.x
+        uses: actions/setup-go@v3
+        with:
+          go-version: ^1.16
+        id: go
+      - name: Get Dependencies
+        run: |
+          go get -v -t -d ./...
+          if [ -f Gopkg.toml ]; then
+             curl https://raw.githubusercontent.com/golang/dep/master/install.sh | sh
+             dep ensure
+          fi
+      - name: Building executable file for ${{ matrix.target }}
+        run: |
+          CurrentVersion=${{ github.ref }}
+          CurrentVersion=${CurrentVersion/'refs/tags/'/''}
+          Project=github.com/${{ github.repository }}
+          Path="$Project/version"
+          ExecName="UnblockNeteaseMusic"
+          GitCommit=$(git rev-parse --short HEAD || echo unsupported)
+          GoVersion=$(go version)
+          BuildTime=$(TZ=UTC-8 date "+%Y-%m-%d %H:%M:%S")
+          buildGo() {
+           GOOS=$1
+           GOARCH=$2
+           CGO="CGO_ENABLED=0"
+           GOARM=""
+           GOMIPS=""
+           output_name=$ExecName
+           suffix=""
+           TargetDir=bin/$GOOS/$GOARCH
+           if [ $GOOS = "windows" ]; then
+             output_name+='.exe'
+           fi
+           if [ $GOOS = "ios" ]; then
+             CGO="CGO_ENABLED=1 CC=$(go env GOROOT)/misc/ios/clangwrap.sh"
+           fi
+           if [ $GOARCH = "arm5" ]; then
+               GOARCH="arm"
+               GOARM="GOARM=5"
+               suffix="5"
+           elif [ $GOARCH = "arm64" ]; then
+               GOARCH="arm64"
+               GOARM=""
+               suffix=""
+           elif [ $GOARCH = "arm7" ]; then
+               GOARCH="arm"
+               GOARM="GOARM=7"
+               suffix="7"
+           fi
+           if [ $GOARCH = "mipsle-softfloat" ]; then
+               GOARCH="mipsle"
+               GOMIPS="GOMIPS=softfloat"
+               suffix="-softfloat"
+           elif [ $GOARCH = "mips-softfloat" ]; then
+               GOARCH="mips"
+               GOMIPS="GOMIPS=softfloat"
+               suffix="-softfloat"
+           fi
+           echo "Building($GOOS/$GOARCH$suffix)..."
+           echo $GOMIPS $GOARM
+           env $GOARM $GOMIPS GOOS=$GOOS GOARCH=$GOARCH $CGO env GOPROXY=https://goproxy.io go build -ldflags "-X '$Path.Version=$CurrentVersion' -X '$Path.BuildTime=$BuildTime' -X '$Path.GoVersion=$GoVersion' -X '$Path.GitCommit=$GitCommit' -X '$Path.ExGoVersionInfo=$suffix' -w -s" -o $TargetDir/$output_name
+           if [ $? -ne 0 ]; then
+              echo 'An error has occurred! Aborting the script execution...'
+              exit 1
+           fi
+           echo "Upxing..."
+           upx --lzma --best $TargetDir/$output_name
+           cp -rf key/ca.crt $TargetDir/
+           cp -rf key/server.key $TargetDir/
+           cp -rf key/server.crt $TargetDir/
+           cp -rf key/createCertificate.sh $TargetDir/
+           ZipName=$ExecName"-"$GOOS"-"$GOARCH"$suffix"
+           zip -j -q -r  $TargetDir/$ZipName.zip $TargetDir
+           cp $TargetDir/$ZipName.zip bin/releaseUpload/
+           echo "ASSET_NAME=$ZipName.zip" >> $GITHUB_ENV
+          }
+          rm -rf bin/
+          mkdir -p bin/releaseUpload
+          mkdir -p key
+          cp ./createCertificate.sh key
+          cd key
+          ./createCertificate.sh
+          cd ..
+          platform=${{ matrix.target }}
+          platform_split=(${platform//\// })
+          buildGo ${platform_split[0]} ${platform_split[1]}
+          echo "--------------------------------------------"
+          echo "Version:" $CurrentVersion
+          echo "Git commit:" $GitCommit
+          echo "Go version:" $GoVersion
+          echo "Build Time:" $BuildTime
+          echo "Build Finish"
+          echo "--------------------------------------------"
+      - name: Create Release And Upload Asset
+        uses: svenstaro/upload-release-action@v2
+        if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: bin/releaseUpload/*
+          file_glob: true
+          tag: ${{ github.ref }}
+          overwrite: true
+          # body: "[bot] automatically publish packages compiled with the latest source code"
+      - name: Publishing to GitHub Artifacts
+        uses: actions/upload-artifact@v3
+        if: ${{ failure() }} || github.event_name == 'workflow_dispatch'
+        with:
+            name: ${{ env.ASSET_NAME }}
+            path: |
+                ./bin/releaseUpload/*
